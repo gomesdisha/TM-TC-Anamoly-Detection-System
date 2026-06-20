@@ -1,0 +1,6 @@
+data/
+models/
+reports/
+*.npy
+*.pkl
+*.pth
