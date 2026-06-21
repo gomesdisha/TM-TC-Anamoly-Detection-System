@@ -516,3 +516,296 @@ print(
     (df["BAT_CUR_RAW_SEL_RT"] == -26.59).sum()
 )"""
 
+"""import pandas as pd
+
+df = pd.read_csv("../reports/june10_anomalies.csv")"""
+
+"""print(df[df["Anomaly"]].head(20))
+print()
+print(df[df["Anomaly"]].tail(20))"""
+
+"""import pandas as pd
+
+df = pd.read_csv("../reports/june10_anomalies.csv")
+
+anom = df[df["Anomaly"]]
+
+print("Total anomalous sequences:", len(anom))
+
+# gap between anomaly timestamps
+
+anom["Timestamp"] = pd.to_datetime(anom["Timestamp"])
+
+diff = anom["Timestamp"].diff()
+
+print(diff.describe())
+
+print("\nLargest gaps:")
+print(diff.sort_values(ascending=False).head(20))"""
+
+"""import pandas as pd
+
+df = pd.read_csv("../reports/june10_anomalies.csv")
+
+anom = df[df["Anomaly"]].copy()
+
+anom["Timestamp"] = pd.to_datetime(anom["Timestamp"])
+
+gaps = anom["Timestamp"].diff()
+
+print(
+    gaps[gaps > pd.Timedelta(minutes=5)]
+)"""
+
+"""import pandas as pd
+
+train = pd.read_csv("../data/train_jun9_10_clean.csv")
+test = pd.read_csv("../data/test_jun11_clean.csv")
+
+for col in [
+    "BUS_VOL_SEL_RT",
+    "BUS_VOL_NSEL_RT",
+    "BAT_CUR_RAW_SEL_RT",
+    "SPS2_BASE_M_TS028_TMP",
+    "LV_M_TS091_TMP"
+]:
+    print("\n", col)
+
+    print(
+        "TRAIN:",
+        train[col].mean(),
+        train[col].std()
+    )
+
+    print(
+        "TEST:",
+        test[col].mean(),
+        test[col].std()
+    )"""
+
+import pandas as pd
+
+"""train = pd.read_csv("../data/train_jun9_10_clean.csv")
+test = pd.read_csv("../data/test_jun11_clean.csv")
+
+features = [
+    "SCE-R_RBUS_VOL",
+    "RCS_THR_D4_TC012_TMP",
+    "SPS1_BASE_M_TS026_TMP",
+    "OBC-2_SNSR_NEG_15V_VOL_AFT_RLY",
+    "APU_BASE_TS057_TMP"
+]
+
+for col in features:
+
+    print("\n", col)
+
+    print(
+        "TRAIN:",
+        train[col].mean(),
+        train[col].std()
+    )
+
+    print(
+        "TEST:",
+        test[col].mean(),
+        test[col].std()
+    )"""
+
+"""injected = pd.DataFrame({
+    "Feature":[
+        "SPS1_BASE_M_TS026_TMP",
+        "BUS_VOL_SEL_RT",
+        "BAT_CUR_RAW_SEL_RT"
+    ],
+    "Start_Row":[5000,15000,25000],
+    "End_Row":[5200,15200,25500]
+})
+
+injected.to_csv(
+    "../reports/injected_anomalies.csv",
+    index=False
+)"""
+
+"""import pandas as pd
+
+df = pd.read_csv("../data/test_jun11_injected.csv")
+
+print(
+    df.loc[
+        5000:5005,
+        ["SPS1_BASE_M_TS026_TMP"]
+    ]
+)
+
+print(
+    df.loc[
+        15000:15005,
+        ["BUS_VOL_SEL_RT"]
+    ]
+)
+
+print(
+    df.loc[
+        25000:25005,
+        ["BAT_CUR_RAW_SEL_RT"]
+    ]
+)"""
+
+"""mport pandas as pd
+
+df = pd.read_csv("../reports/june11_injected_results.csv")
+
+print(df.iloc[4950:5250]["Anomaly"].value_counts())
+print(df.iloc[14950:15250]["Anomaly"].value_counts())
+print(df.iloc[24950:25550]["Anomaly"].value_counts())"""
+
+"""import pandas as pd
+
+# Results from model
+results = pd.read_csv(
+    "../reports/june11_injected_results.csv"
+)
+
+# -------------------------
+# Injected Regions
+# -------------------------
+
+regions = [
+    ("Temperature", 5000, 5200),
+    ("Voltage", 15000, 15200),
+    ("Battery", 25000, 25500)
+]
+
+total_injected = 0
+total_detected = 0
+
+print("\n===== INJECTED ANOMALY TEST =====\n")
+
+for name, start, end in regions:
+
+    subset = results.iloc[start:end+1]
+
+    detected = subset["Anomaly"].sum()
+
+    total = len(subset)
+
+    rate = detected / total * 100
+
+    total_detected += detected
+    total_injected += total
+
+    print(
+        f"{name:12s}"
+        f" | Detected: {detected:4d}"
+        f" / {total:4d}"
+        f" | Rate: {rate:.2f}%"
+    )
+
+print("\n==============================")
+
+overall_rate = (
+    total_detected /
+    total_injected
+) * 100
+
+print(
+    f"Overall Detection Rate: "
+    f"{overall_rate:.2f}%"
+)
+
+print(
+    f"Detected {total_detected}"
+    f" of {total_injected}"
+    f" injected anomalies"
+)
+
+# -------------------------
+# Ground Truth Labels
+# -------------------------
+
+truth = [False] * len(results)
+
+for _, start, end in regions:
+
+    for i in range(start, end + 1):
+        truth[i] = True
+
+results["Truth"] = truth
+
+TP = ((results["Truth"] == True) &
+      (results["Anomaly"] == True)).sum()
+
+FP = ((results["Truth"] == False) &
+      (results["Anomaly"] == True)).sum()
+
+FN = ((results["Truth"] == True) &
+      (results["Anomaly"] == False)).sum()
+
+TN = ((results["Truth"] == False) &
+      (results["Anomaly"] == False)).sum()
+
+precision = TP / (TP + FP)
+recall = TP / (TP + FN)
+f1 = 2 * precision * recall / (precision + recall)
+
+print("\n===== METRICS =====")
+
+print("TP:", TP)
+print("FP:", FP)
+print("FN:", FN)
+print("TN:", TN)
+
+print("\nPrecision:", round(precision, 4))
+print("Recall   :", round(recall, 4))
+print("F1 Score :", round(f1, 4))
+
+"""
+
+import pandas as pd
+
+results = pd.read_csv(
+    "../reports/june11_injected_results.csv"
+)
+
+regions = [
+    ("Temperature", 5000, 5200),
+    ("Voltage", 15000, 15200),
+    ("Battery", 25000, 25500)
+]
+
+total_detected = 0
+total_injected = 0
+
+print("\n===== INJECTED ANOMALY EVALUATION =====\n")
+
+for name, start, end in regions:
+
+    subset = results.iloc[start:end+1]
+
+    TP = subset["Anomaly"].sum()
+
+    FN = len(subset) - TP
+
+    recall = TP / (TP + FN)
+
+    print(
+        f"{name:12s}"
+        f" | TP={TP:4d}"
+        f" | FN={FN:4d}"
+        f" | Detection Rate={recall*100:.2f}%"
+    )
+
+    total_detected += TP
+    total_injected += len(subset)
+
+overall_recall = (
+    total_detected /
+    total_injected
+)
+
+print("\n==============================")
+print(
+    f"Overall Detection Rate: "
+    f"{overall_recall*100:.2f}%"
+)

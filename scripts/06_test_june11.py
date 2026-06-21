@@ -8,7 +8,7 @@ import joblib
 # CONFIG
 # =========================
 
-DATA_FILE = "../data/test_jun11_clean.csv"
+DATA_FILE = "../data/test_jun11_injected.csv"
 
 SEQ_LEN = 60
 
@@ -204,11 +204,9 @@ print(
     )
 )
 
-# =========================
-# SAVE REPORT
-# =========================
+#SAVE REPORT
 
-results = pd.DataFrame({
+"""results = pd.DataFrame({
 
     "Timestamp":
         sequence_times,
@@ -231,4 +229,83 @@ print(
 
 print(
     "../reports/june10_anomalies.csv"
+)"""
+
+# =========================
+# SAVE REPORTS
+# =========================
+
+results = pd.DataFrame({
+
+    "Timestamp": sequence_times,
+
+    "Error": errors,
+
+    "Anomaly": anomaly_mask
+})
+
+# -------------------------
+# Save full report
+# -------------------------
+
+"""results.to_csv(
+    "../reports/june11_all_results.csv",
+    index=False
+)"""
+
+# -------------------------
+# Save anomalies only
+# -------------------------
+
+anomalies_only = results[
+    results["Anomaly"] == True
+]
+
+"""anomalies_only.to_csv(
+    "../reports/june11_anomalies_only.csv",
+    index=False
+)"""
+
+results.to_csv(
+    "../reports/june11_injected_results.csv",
+    index=False
+)
+
+print(" ADDED INJECTED ANAMOLIES TO CSV !! ")
+
+# -------------------------
+# Print anomalies
+# -------------------------
+
+print("\n")
+print("=" * 50)
+print("FIRST 50 ANOMALIES DETECTED")
+print("=" * 50)
+
+"""for _, row in anomalies_only.iterrows():
+
+    print(
+        f"{row['Timestamp']} | "
+        f"Error={row['Error']:.4f}"
+    )"""
+
+for _, row in anomalies_only.head(50).iterrows():
+
+    print(
+        f"{row['Timestamp']} | "
+        f"Error={row['Error']:.4f}"
+    )
+
+print(
+    f"\nTotal anomalies saved: {len(anomalies_only)}"
+)
+
+print("\nSaved:")
+
+print(
+    "../reports/june11_all_results.csv"
+)
+
+print(
+    "../reports/june11_anomalies_only.csv"
 )
