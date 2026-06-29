@@ -1,0 +1,524 @@
+
+
+"""Does websocket work?
+How many parameters arrive?
+What does one packet look like?
+
+
+Expected output:
+Connected
+Parameter Count: 500
+or
+Parameter Count: 10"""
+
+import asyncio
+import json
+import requests
+import numpy as np
+import pandas as pd
+import torch
+import websockets
+
+from bs4 import BeautifulSoup
+#from tcn_gru_autoencoder import TCN_GRU_Autoencoder
+
+# ==========================================
+# CONFIG
+# ==========================================
+
+WS_URL = "ws://172.20.10.1:9000/ws/ntm"
+COMMAND_PAGE_URL = "http://172.20.10.1:8888/PEPSUMMARY/Summary.jsp?ScName=EOS-10"
+
+WINDOW = 30
+THRESHOLD = 0.0001
+
+buffer = []
+
+# ==========================================
+# MODEL
+# ==========================================
+
+"""model = TCN_GRU_Autoencoder()
+
+model.load_state_dict(
+    torch.load(
+        "tcn_gru_model_10f.pth",
+        map_location="cpu"
+    )
+)
+
+model.eval()"""
+
+
+# ==========================================
+# TELECOMMAND SCRAPING
+# ==========================================
+
+def get_latest_command():
+    try:
+        html = requests.get(COMMAND_PAGE_URL, timeout=5).text
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator=" ")
+
+        if "TCR_R_ON" in text:
+            return "TCR_R_ON"
+        elif "TCR_VOL&CUR_SET_R" in text:
+            return "TCR_VOL&CUR_SET_R"
+        return "NONE"
+    except Exception:
+        return "NONE"
+
+
+# ==========================================
+# COMMAND ENCODING
+# ==========================================
+
+def encode_command(cmd):
+    mapping = {
+        "NONE": 0,
+        "TCR_R_ON": 1,
+        "TCR_VOL&CUR_SET_R": 2
+    }
+    return mapping.get(cmd, 0)
+
+
+# ==========================================
+# TELEMETRY ENCODING
+# ==========================================
+
+def encode_value(value):
+    if isinstance(value, str):
+        value = value.upper()
+        if value in ["ON", "LOCK", "TRUE", "POS-1"]:
+            return 1.0
+        if value in ["OFF", "UNLOCK", "FALSE", "POS-2"]:
+            return 0.0
+        return 0.0
+    try:
+        return float(value)
+    except:
+        return 0.0
+
+
+# ==========================================
+# FEATURE VECTOR
+# ==========================================
+
+def build_feature_vector(telemetry, command):
+    keys = [
+        "XSW-02_SW_POS", "XPA-M_DCDC-1_STS", "XPA-M_DCDC-2_STS",
+        "XPA-R_DCDC-1_STS", "XPA-R_DCDC-2_STS", "PLD_TX-1_STS",
+        "PLD_TX-2_STS", "PLD_TX-1_LOCK_STS", "PLD_TX-2_LOCK_STS"
+    ]
+    return [
+        encode_value(telemetry.get(k, 0))
+        for k in keys
+    ] + [encode_command(command)]
+
+
+# ==========================================
+# DETECTION
+# ==========================================
+
+def detect(window):
+    x = torch.tensor(np.array(window, dtype=np.float32)).unsqueeze(0)
+    with torch.no_grad():
+        reconstructed = model(x)
+        error = torch.mean((x - reconstructed) ** 2).item()
+
+    status = "NORMAL" if error <= THRESHOLD else "ANOMALY"
+    print(f"Score={error:.6f} | Threshold={THRESHOLD:.6f} | Status={status}")
+    return status
+
+
+# ==========================================
+# PID MAPPING & WEBSOCKET CLIENT
+# ==========================================
+
+def fetch_pid_mapping():
+    url = "http://172.20.10.1:9000/pid_info?sc_id=EOS-10"
+    print(f"🔍 Fetching PID map from: {url}")
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not isinstance(data, list):
+            print(f" Unexpected structure: {type(data)}")
+            return {}, {}
+
+        # Go struct uses lowercase keys: "pid", "mnemonic"
+        pid_map = {}  # mnemonic -> pid
+        reverse_pid_map = {}  # pid -> mnemonic
+
+        for item in data:
+            if isinstance(item, dict) and "mnemonic" in item and "pid" in item:
+                mnemonic = item["mnemonic"].upper()
+                pid = item["pid"]
+                pid_map[mnemonic] = pid
+                reverse_pid_map[pid] = mnemonic
+
+        print(f"Loaded {len(pid_map)} PID mappings")
+        return pid_map, reverse_pid_map
+    except Exception as e:
+        print(f" PID fetch failed: {e}")
+        return {}, {}
+
+
+# Initialize PID maps
+PID_MAP, REVERSE_PID_MAP = fetch_pid_mapping()
+
+"""TARGET_MNEMONICS = [
+    "XSW-02_SW_POS", "XPA-M_DCDC-1_STS", "XPA-M_DCDC-2_STS",
+    "XPA-R_DCDC-1_STS", "XPA-R_DCDC-2_STS", "PLD_TX-1_STS",
+    "PLD_TX-2_STS", "PLD_TX-1_LOCK_STS", "PLD_TX-2_LOCK_STS"
+]"""
+
+selected = pd.read_csv("../config/selected_features.csv")
+TARGET_MNEMONICS = (selected.iloc[:,0].astype(str).tolist())
+print(
+    "Selected Features:",
+    len(TARGET_MNEMONICS)
+)#newly added
+
+# Extract PIDs for target mnemonics
+#TARGET_PIDS = [PID_MAP[m] for m in TARGET_MNEMONICS if m in PID_MAP]
+TARGET_PIDS = [
+    PID_MAP[m.upper()]
+    for m in TARGET_MNEMONICS
+    if m.upper() in PID_MAP
+]
+print(
+    "Matched PIDs:",
+    len(TARGET_PIDS)
+)
+
+print(f" Subscribing to PIDs: {TARGET_PIDS}")
+
+
+async def main():
+    if not TARGET_PIDS:
+        print(" No valid PIDs found. Check PID mapping.")
+        return
+
+    try:
+        async with websockets.connect(
+                WS_URL,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5
+        ) as ws:
+            print(" Connected to WS")
+
+            # Construct subscription request matching Go 'request' struct
+            sub_payload = {
+                "user_id": "PRISM",
+                "msg_type": "ntm",
+                "msg_payload": {
+                    "sc_id": "EOS-10",
+                    "stream": "ANY-TM1",
+                    "action": "subscribe",
+                    "parameters": TARGET_PIDS
+                },
+                "on_change": False
+            }
+
+            print(" Sending subscription request...")
+            await ws.send(json.dumps(sub_payload))
+            print(" Subscription sent")
+
+            print("\n Listening for telemetry...")
+            msg_count = 0
+            while True:
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=300)
+                    msg_count += 1
+
+                    if msg_count == 1:
+                      print("\n================ RAW MESSAGE ================")
+                      print(msg[:5000])
+                      print("=============================================\n")
+
+                    print(f" [{msg_count}] {msg[:300]}...")
+
+                    # Parse response matching Go 'response' and 'responsePayload' structs
+                    telemetry = {}
+                    try:
+                        resp = json.loads(msg)
+                        payload = resp.get("msg_payload", {})
+                        params_info = payload.get("parameters_info", [])
+
+                        print("\n====================")
+                        print("PARAMETER COUNT:",len(params_info))
+                        print("\nFIRST 10 PARAMETERS:")
+                        for p in params_info[:10]:
+                          print(p)
+                        print("====================\n")
+
+                        """print("\nTELEMETRY FEATURES RECEIVED:")
+                        print(len(telemetry))
+                        print("\nFIRST 20 FEATURE NAMES:")
+                        print(list(telemetry.keys())[:20])"""
+
+
+                        for p in params_info:
+                            pid = p.get("param")
+                            mnemonic = REVERSE_PID_MAP.get(pid)
+                            if mnemonic:
+                                # Value extraction matching Go 'Parameter' struct
+                                val = p.get("str_v") if p.get("str_v") else p.get("float_v")
+                                telemetry[mnemonic] = val
+                                print(f"   {mnemonic} ({pid}): {val}")
+
+                        print("\nTELEMETRY FEATURES RECEIVED:")
+                        print(len(telemetry))
+                        print("\nFIRST 20 FEATURE NAMES:")
+                        print(list(telemetry.keys())[:20])
+
+                        # ==========================================
+                        # SAVE LIVE TELEMETRY
+                        # ==========================================
+
+                        if not hasattr(main, "rows"):
+                            main.rows = []
+
+                        main.rows.append(telemetry.copy())
+
+                        if len(main.rows) % 50 == 0:
+
+                            pd.DataFrame(main.rows).to_csv(
+                                "live_tm.csv",
+                                index=False
+                            )
+
+                            print(
+                                f"Saved {len(main.rows)} rows to live_tm.csv"
+                            )
+
+                    except json.JSONDecodeError as je:
+                        print(f" Invalid JSON: {je}")
+                    except Exception as proc_err:
+                        print(f" Processing error: {proc_err}")
+
+                    # Build feature vector and detect
+                    """command = await asyncio.to_thread(get_latest_command)
+                    fv = build_feature_vector(telemetry, command)
+                    buffer.append(fv)
+                    if len(buffer) > WINDOW:
+                        buffer.pop(0)
+                    if len(buffer) == WINDOW:
+                        detect(buffer)"""
+
+                except asyncio.TimeoutError:
+                    print(" Timeout waiting for telemetry")
+                    break
+                except websockets.exceptions.ConnectionClosed as e:
+                    print(f" Connection closed: {e}")
+                    break
+                except Exception as e:
+                    print(f" Unexpected error: {e}")
+                    break
+
+    except Exception as e:
+        print(f" Connection failed: {e}")
+
+
+if __name__ == "__main__":
+    print("Starting WebSocket telemetry listener...")
+    asyncio.run(main())
+
+"""Receive websocket packet
+        ↓
+Build telemetry dictionary
+        ↓
+Print telemetry info
+        ↓
+Save telemetry row
+        ↓
+Wait for next packet"""
+
+
+(ml_env) csrspdev@pdap-system2:~/Aravind/disha-jun22/scripts$ python 09_websocket_debug.py
+🔍 Fetching PID map from: http://172.20.10.1:9000/pid_info?sc_id=EOS-10
+Loaded 6962 PID mappings
+Selected Features: 139
+Matched PIDs: 139
+ Subscribing to PIDs: ['OBC1H005', 'OBC1H027', 'OBC1H028', 'OBC1H029', 'OBC2H005', 'OBC2H029', 'PWR20084', 'PWRC0004', 'PWRC0006', 'PWRC1004', 'PWRS0084', 'PWRS0086', 'PWRS0088', 'PWRS0089', 'PWRS0090', 'PWRS0114', 'PWRS0118', 'PWRS0126', 'PWRS1084', 'PWRS1086', 'PWRS1088', 'PWRS1089', 'PWRS1090', 'RCS00009', 'RCS00010', 'SCT00001', 'SCT00002', 'SCT00003', 'SCT10003', 'SCT10031', 'SCT10032', 'SCT10033', 'THR01002', 'THR01003', 'THR01004', 'THR01005', 'THR01006', 'THR01007', 'THR01008', 'THR01009', 'THR01010', 'THR01011', 'THR01012', 'THR01013', 'THR01015', 'THR01016', 'THR01017', 'THR01018', 'THR01019', 'THR01020', 'THR01021', 'THR01022', 'THR01024', 'THR01027', 'THR01031', 'THR01032', 'THR01033', 'THR01034', 'THR01036', 'THR01038', 'THR01039', 'THR01040', 'THR01041', 'THR01042', 'THR01043', 'THR01044', 'THR01045', 'THR01046', 'THR01047', 'THR01048', 'THR01049', 'THR01051', 'THR01053', 'THR01054', 'THR01057', 'THR01058', 'THR01059', 'THR01060', 'THR01064', 'THR01087', 'THR01122', 'THR01123', 'THR01126', 'THR01132', 'THR01141', 'THR01162', 'THR01163', 'THR01164', 'THR01165', 'THR01166', 'THR01168', 'THR01170', 'THR01171', 'THR01175', 'THR01176', 'THR01177', 'THR01178', 'THR01179', 'THR01180', 'THR01181', 'THR01190', 'THR01191', 'THR01195', 'THR01196', 'THR01197', 'THR01198', 'THR01199', 'THR01201', 'THR01203', 'THR01205', 'THR01207', 'THR01208', 'THR01210', 'THR01214', 'THR01215', 'THR01217', 'THR01218', 'THR01222', 'THR01223', 'THR01246', 'THR01281', 'THR01282', 'THR01285', 'THR01292', 'THR01300', 'THR01302', 'THR01303', 'THR04001', 'THR04002', 'THR04003', 'THR04004', 'THR04005', 'THR04006', 'THR04009', 'THR04010', 'THR04011', 'THR04012', 'THR04013', 'THR04014']
+Starting WebSocket telemetry listener...
+ Connected to WS
+ Sending subscription request...
+ Subscription sent
+
+ Listening for telemetry...
+
+================ RAW MESSAGE ================
+{"user_id":"","msg_type":"ntm","msg_payload":{"sc_id":"EOS-10","stream":"GCO3-TM1","frame_time":"22-Jun-2026 04:23:37.035","frame_id":3,"error":"","parameters_info":[{"param":"OBC1H005","tm_cnt":"65","float_v":"-14.79","str_v":"-14.790000","ltm_flg":"0"},{"param":"OBC1H027","tm_cnt":"71","float_v":"-9.975999999999999","str_v":"-9.976000","ltm_flg":"0"},{"param":"OBC1H028","tm_cnt":"180","float_v":"5.010000000000002","str_v":"5.010000","ltm_flg":"0"},{"param":"OBC1H029","tm_cnt":"226","float_v":"36.664","str_v":"36.664000","ltm_flg":"0"},{"param":"OBC2H005","tm_cnt":"65","float_v":"-14.79","str_v":"-14.790000","ltm_flg":"0"},{"param":"OBC2H029","tm_cnt":"226","float_v":"36.664","str_v":"36.664000","ltm_flg":"0"},{"param":"PWR20084","tm_cnt":"233","float_v":"14.213880000000003","str_v":"14.21","ltm_flg":"0"},{"param":"PWRC0004","tm_cnt":"107","float_v":"2.391054099999998","str_v":"2.39","ltm_flg":"0"},{"param":"PWRC0006","tm_cnt":"14","float_v":"2.102276383","str_v":"2.10","ltm_flg":"0"},{"param":"PWRC1004","tm_cnt":"106","float_v":"2.1263388140000004","str_v":"2.13","ltm_flg":"0"},{"param":"PWRS0084","tm_cnt":"24","float_v":"2.0086124182000002","str_v":"2.01","ltm_flg":"0"},{"param":"PWRS0086","tm_cnt":"106","float_v":"2.1645217840000015","str_v":"2.16","ltm_flg":"0"},{"param":"PWRS0088","tm_cnt":"22","float_v":"1.889871803","str_v":"1.89","ltm_flg":"0"},{"param":"PWRS0089","tm_cnt":"12","float_v":"-1.9876385779999999","str_v":"-1.99","ltm_flg":"0"},{"param":"PWRS0090","tm_cnt":"220","float_v":"37.10177968","str_v":"37.10","ltm_flg":"0"},{"param":"PWRS0114","tm_cnt":"16","float_v":"1.900996576","str_v":"1.90","ltm_flg":"0"},{"param":"PWRS0118","tm_cnt":"7","float_v":"-2.581700008","str_v":"-2.58","ltm_flg":"2"},{"param":"PWRS0126","tm_cnt":"16","float_v":"1.89366736","str_v":"1.89","ltm_flg":"0"},{"param":"PWRS1084","tm_cnt":"24","float_v":"1.9999530576","str_v":"2.00","ltm_flg":"0"},{"param":"PWRS1086","tm_cnt":"106","float_v":"2.177551263999998","str_v":"2.18","ltm_flg":"0"},{"param":"PWRS1088","tm_cnt":"22","float_v":"1.873809466","str_v":"1.87","ltm_flg":"0"},{"param":"PWRS1089","tm_cnt":"12","float_v":"-1.9794359000000001","str_v":"-1.98","ltm_flg":"0"},{"param":"PWRS1090","tm_cnt":"220","float_v":"37.14000445999999","str_v":"37.14","ltm_flg":"0"},{"param":"RCS00009","tm_cnt":"129","float_v":"15.012493659","str_v":"15.01","ltm_flg":"0"},{"param":"RCS00010","tm_cnt":"130","float_v":"14.862556110000002","str_v":"14.86","ltm_flg":"0"},{"param":"SCT00001","tm_cnt":"128","float_v":"0.019885431372548723","str_v":"0.02","ltm_flg":"0"},{"param":"SCT00002","tm_cnt":"128","float_v":"0.019885431372548723","str_v":"0.02","ltm_flg":"0"},{"param":"SCT00003","tm_cnt":"129","float_v":"0.5980411764705877","str_v":"0.60","ltm_flg":"0"},{"param":"SCT10003","tm_cnt":"130","float_v":"0.9967352941176415","str_v":"1.00","ltm_flg":"0"},{"param":"SCT10031","tm_cnt":"128","float_v":"0.08525196799999968","str_v":"0.09","ltm_flg":"0"},{"param":"SCT10032","tm_cnt":"128","float_v":"0.2203261439999995","str_v":"0.22","ltm_flg":"0"},{"param":"SCT10033","tm_cnt":"130","float_v":"0.27568329999999897","str_v":"0.28","ltm_flg":"0"},{"param":"THR01002","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01003","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01004","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01005","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01006","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01007","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01008","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01009","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01010","tm_cnt":"196","float_v":"21","str_v":"21","ltm_flg":"0"},{"param":"THR01011","tm_cnt":"255","float_v":"-76","str_v":"-76","ltm_flg":"2"},{"param":"THR01012","tm_cnt":"196","float_v":"21","str_v":"21","ltm_flg":"0"},{"param":"THR01013","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01015","tm_cnt":"196","float_v":"21","str_v":"21","ltm_flg":"0"},{"param":"THR01016","tm_cnt":"196","float_v":"21","str_v":"21","ltm_flg":"0"},{"param":"THR01017","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01018","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01019","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01020","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01021","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01022","tm_cnt":"255","float_v":"-76","str_v":"-76","ltm_flg":"2"},{"param":"THR01024","tm_cnt":"196","float_v":"21","str_v":"21","ltm_flg":"0"},{"param":"THR01027","tm_cnt":"255","float_v":"-76","str_v":"-76","ltm_flg":"2"},{"param":"THR01031","tm_cnt":"195","float_v":"22","str_v":"22","ltm_flg":"0"},{"param":"THR01032","tm_cnt":"195","float_
+=============================================
+
+ [1] {"user_id":"","msg_type":"ntm","msg_payload":{"sc_id":"EOS-10","stream":"GCO3-TM1","frame_time":"22-Jun-2026 04:23:37.035","frame_id":3,"error":"","parameters_info":[{"param":"OBC1H005","tm_cnt":"65","float_v":"-14.79","str_v":"-14.790000","ltm_flg":"0"},{"param":"OBC1H027","tm_cnt":"71","float_v":"...
+
+====================
+PARAMETER COUNT: 139
+
+FIRST 10 PARAMETERS:
+{'param': 'OBC1H005', 'tm_cnt': '65', 'float_v': '-14.79', 'str_v': '-14.790000', 'ltm_flg': '0'}
+{'param': 'OBC1H027', 'tm_cnt': '71', 'float_v': '-9.975999999999999', 'str_v': '-9.976000', 'ltm_flg': '0'}
+{'param': 'OBC1H028', 'tm_cnt': '180', 'float_v': '5.010000000000002', 'str_v': '5.010000', 'ltm_flg': '0'}
+{'param': 'OBC1H029', 'tm_cnt': '226', 'float_v': '36.664', 'str_v': '36.664000', 'ltm_flg': '0'}
+{'param': 'OBC2H005', 'tm_cnt': '65', 'float_v': '-14.79', 'str_v': '-14.790000', 'ltm_flg': '0'}
+{'param': 'OBC2H029', 'tm_cnt': '226', 'float_v': '36.664', 'str_v': '36.664000', 'ltm_flg': '0'}
+{'param': 'PWR20084', 'tm_cnt': '233', 'float_v': '14.213880000000003', 'str_v': '14.21', 'ltm_flg': '0'}
+{'param': 'PWRC0004', 'tm_cnt': '107', 'float_v': '2.391054099999998', 'str_v': '2.39', 'ltm_flg': '0'}
+{'param': 'PWRC0006', 'tm_cnt': '14', 'float_v': '2.102276383', 'str_v': '2.10', 'ltm_flg': '0'}
+{'param': 'PWRC1004', 'tm_cnt': '106', 'float_v': '2.1263388140000004', 'str_v': '2.13', 'ltm_flg': '0'}
+====================
+
+   OBC-1_SNSR_NEG_15V_VOL_AFT_RLY (OBC1H005): -14.790000
+   OBC-1_NEG_10V_VOL (OBC1H027): -9.976000
+   OBC-1_VTH_VOL (OBC1H028): 5.010000
+   OBC-1_UBUS_VOL (OBC1H029): 36.664000
+   OBC-2_SNSR_NEG_15V_VOL_AFT_RLY (OBC2H005): -14.790000
+   OBC-2_UBUS_VOL (OBC2H029): 36.664000
+   DOM_REG-2_VOL_SEL_RT (PWR20084): 14.21
+   BAT_RAW_CUR-M (PWRC0004): 2.39
+   LOAD_RAW_CUR (PWRC0006): 2.10
+   BAT_RAW_CUR-R (PWRC1004): 2.13
+   BAT_DIS_CUR_LR_SEL_RT (PWRS0084): 2.01
+   BAT_CUR_RAW_SEL_RT (PWRS0086): 2.16
+   BUS_LOAD_CUR_LR_SEL_RT (PWRS0088): 1.89
+   BAT_CHRG_CUR_TCR_SEL_RT (PWRS0089): -1.99
+   BUS_VOL_SEL_RT (PWRS0090): 37.10
+   STRING_CUR_SEL_RT (PWRS0114): 1.90
+   BAT_CHRG_ZERO_CUR_SEL_RT (PWRS0118): -2.58
+   ALT_FPGA_STRING_CUR_SEL_RT (PWRS0126): 1.89
+   BAT_DIS_CUR_LR_NSEL_RT (PWRS1084): 2.00
+   BAT_CUR_RAW_NSEL_RT (PWRS1086): 2.18
+   BUS_LOAD_CUR_LR_NSEL_RT (PWRS1088): 1.87
+   BAT_CHRG_CUR_TCR_NSEL_RT (PWRS1089): -1.98
+   BUS_VOL_NSEL_RT (PWRS1090): 37.14
+   PRES_TRANS-1_O/P (RCS00009): 15.01
+   PRES_TRANS-2_O/P (RCS00010): 14.86
+   SSM-M_MOTOR_CUR (SCT00001): 0.02
+   SSM-M_TCS_VOL (SCT00002): 0.02
+   SCE-M_RBUS_VOL (SCT00003): 0.60
+   SCE-R_RBUS_VOL (SCT10003): 1.00
+   SCAT_TWTA-M_HELIX_CUR_DIRECT (SCT10031): 0.09
+   SCAT_TWTA-M_BUS_CUR_DIRECT (SCT10032): 0.22
+   SCAT_TWTA-R_HELIX_CUR_DIRECT (SCT10033): 0.28
+   BDH_CARD_1_TS005_TMP (THR01002): 22
+   BDH_DCDC_BASE_M_TS007_TMP (THR01003): 22
+   SSR_CARD1_TS009_TMP (THR01004): 22
+   XBS_M_TS013_TMP (THR01005): 22
+   XPF_PLATE-1_XPC_3_4_TS015_TMP (THR01006): 22
+   XPA_SSPA_M_TS017_TMP (THR01007): 22
+   XPF_PLATE-1_NR_SSPA_TS019_TMP (THR01008): 22
+   XPF_PLATE-1_XPC_1_2_TS021_TMP (THR01009): 22
+   SCTX_10_TS022_TMP (THR01010): 21
+   GCRX_10_LO_DECK_M_TS024_TMP (THR01011): -76
+   SPS1_BASE_M_TS026_TMP (THR01012): 21
+   SPS2_BASE_M_TS028_TMP (THR01013): 22
+   BAT1_BODY_TS033_TMP (THR01015): 21
+   BAT1_HTR_M_TS034_TMP (THR01016): 21
+   BAT2_HTR_M_TS037_TMP (THR01017): 22
+   BAT_DIFF_PLT_TS039_TMP (THR01018): 22
+   CPE10_BASE_M_TS046_TMP (THR01019): 22
+   OBC1_BASE_TS049_TMP (THR01020): 22
+   OBC1_PKG_TS050_TMP (THR01021): 22
+   SS1_M_TS053_TMP (THR01022): -76
+   APU_BASE_TS057_TMP (THR01024): 21
+   RW1_CASING_TS064_TMP (THR01027): -76
+   IRU_M_TS072_TMP (THR01031): 22
+   IRU_BASE_TS074_TMP (THR01032): 22
+   EP02_SADA_SHFT_ASS_TS076_TMP (THR01033): 22
+   EP04_SADA_SHFT_SS_TS078_TMP (THR01034): 22
+   WDE_10_20_TS082_TMP (THR01036): 22
+   P1_SADA_ELX_BASE_TS085_TMP (THR01038): 21
+   FUELTANK-1_TS087_TMP (THR01039): 21
+   FUELTANK-2_TS089_TMP (THR01040): 22
+   LV_M_TS091_TMP (THR01041): 21
+   FCV_R1_TS093_TMP (THR01042): 21
+   FCV_R2_TS094_TMP (THR01043): 21
+   FCV_R3_TS095_TMP (THR01044): 22
+   FCV_R4_TS096_TMP (THR01045): 21
+   11N_FCV_D1_TS101_TMP (THR01046): 21
+   11N_FCV_D2_TS102_TMP (THR01047): 21
+   11N_PLMLN_1_TS105_TMP (THR01048): 20
+   PL_LN_SHRPNL_1_TS107_TMP (THR01049): 21
+   PL_LN_DP1_NEGY_1_TS111_TMP (THR01051): 21
+   SCTX_STC_GCRX-20_TS120_TMP (THR01053): 20
+   EP04_SADA_HOUS_SS_TS077_TMP (THR01054): 22
+   DP01GCRX-10_TS119_TMP (THR01057): 21
+   EP01_PNL_TS122_TMP (THR01058): 22
+   EP03_PNL_TS164_TMP (THR01059): 22
+   SAFE_ES-1_BP_TS063_TMP (THR01060): -76
+   XBS-111_TS173_TMP (THR01064): 22
+   P2_SADA_ELX_AMP-M_TS079_TMP (THR01087): 22
+   P1_SADA_ELX_AMP-M_TS083_TMP (THR01122): 22
+   SSR_BASE_M_TS003_TMP (THR01123): 23.5
+   SSR_DCDC_BASE_M_TS011_TMP (THR01126): 22
+   BDH_CARD3_TS244_TMP (THR01132): 22
+   DP01SCTX_STC-10_TS263_TMP (THR01141): 22
+   BDH_CARD_2_TS006_TMP (THR01162): 22
+   BDH_DCDC_BASE_R_TS008_TMP (THR01163): 22
+   SSR_CARD2_TS010_TMP (THR01164): 22
+   XBS_R_TS014_TMP (THR01165): 21
+   XPF_PLATE-2_XPC_5_6_TS016_TMP (THR01166): 22
+   XPF_PLATE-2_XPC_7_8_TS020_TMP (THR01168): 22
+   SCTX_20_TS023_TMP (THR01170): 20
+   GCRX_20_LO_DECK_R_TS025_TMP (THR01171): 24
+   BAT1_HTR_R_TS035_TMP (THR01175): 21
+   BAT2_BODY_TS036_TMP (THR01176): 21
+   BAT2_HTR_R_TS038_TMP (THR01177): 20
+   CPE10_BASE_R_TS047_TMP (THR01178): 21
+   EP03_PNL_CONTG_HTR_TS048_TMP (THR01179): 21
+   OBC2_PKG_TS052_TMP (THR01180): 22
+   OBC2_BASE_TS051_TMP (THR01181): 22
+   IRU_R_TS073_TMP (THR01190): 21
+   EP02_SADA_HOUS_ASS_TS075_TMP (THR01191): 21
+   WDE_20_30_TS086_TMP (THR01195): 21
+   P2_SADA_ELX_BASE_TS081_TMP (THR01196): 21
+   FUELTANK-1_TS088_TMP (THR01197): 21
+   FUELTANK-2_TS090_TMP (THR01198): 21
+   LV_R_TS092_TMP (THR01199): 21
+   FCV_R6_TS098_TMP (THR01201): 21
+   FCV_R8_TS100_TMP (THR01203): 21
+   11N_FCV_D4_TS104_TMP (THR01205): 20
+   11N_PLMLN_2_TS106_TMP (THR01207): 21
+   PL_LN_SHRPNL_2_TS108_TMP (THR01208): 21
+   PL_LN_DP1_NEGY_2_TS112_TMP (THR01210): 21
+   IF_RING_NEG_Y_TS116_TMP (THR01214): 21
+   CYLDR_NEG_P_TS118_TMP (THR01215): 21
+   EP02_PNL_TS163_TMP (THR01217): 21
+   EP04_PNL_TS165_TMP (THR01218): 22
+   DP01_CJ_BOX_TS172_TMP (THR01222): 21
+   XBS-211_TS174_TMP (THR01223): 21
+   P2_SADA_ELX_AMP-R_TS080_TMP (THR01246): 21
+   P1_SADA_ELX_AMP-R_TS084_TMP (THR01281): 22
+   SSR_BASE_R_TS004_TMP (THR01282): 21
+   SSR_DCDC_BASE_R_TS012_TMP (THR01285): 21
+   BDH_CARD4_TS245_TMP (THR01292): 22
+   MATHS_TSU-BE-R_TS262_TMP (THR01300): -76
+   GCRX_20_RF_DECK_R_TS265_TMP (THR01302): 22
+   MATHS_TSU-FE-R_TS267_TMP (THR01303): -76
+   RCS_THR_R1_TC001_TMP (THR04001): -4.059
+   RCS_THR_R2_TC002_TMP (THR04002): -4.059
+   RCS_THR_R3_TC003_TMP (THR04003): 0.466
+   RCS_THR_R4_TC004_TMP (THR04004): -4.059
+   RCS_THR_D1_TC009_TMP (THR04005): -4.059
+   RCS_THR_D3_TC011_TMP (THR04006): 0.466
+   RCS_THR_R5_TC005_TMP (THR04009): 0.466
+   RCS_THR_R6_TC006_TMP (THR04010): 0.466
+   RCS_THR_R7_TC007_TMP (THR04011): 0.466
+   RCS_THR_R8_TC008_TMP (THR04012): 0.466
+   RCS_THR_D2_TC010_TMP (THR04013): 0.466
+   RCS_THR_D4_TC012_TMP (THR04014): 0.466
+
+TELEMETRY FEATURES RECEIVED:
+139
+
+FIRST 20 FEATURE NAMES:
+['OBC-1_SNSR_NEG_15V_VOL_AFT_RLY', 'OBC-1_NEG_10V_VOL', 'OBC-1_VTH_VOL', 'OBC-1_UBUS_VOL', 'OBC-2_SNSR_NEG_15V_VOL_AFT_RLY', 'OBC-2_UBUS_VOL', 'DOM_REG-2_VOL_SEL_RT', 'BAT_RAW_CUR-M', 'LOAD_RAW_CUR', 'BAT_RAW_CUR-R', 'BAT_DIS_CUR_LR_SEL_RT', 'BAT_CUR_RAW_SEL_RT', 'BUS_LOAD_CUR_LR_SEL_RT', 'BAT_CHRG_CUR_TCR_SEL_RT', 'BUS_VOL_SEL_RT', 'STRING_CUR_SEL_RT', 'BAT_CHRG_ZERO_CUR_SEL_RT', 'ALT_FPGA_STRING_CUR_SEL_RT', 'BAT_DIS_CUR_LR_NSEL_RT', 'BAT_CUR_RAW_NSEL_RT']
+ Timeout waiting for telemetry
+
+ MY CONCERN IS EVERYTHING IS WORKING BUT ITS NOT SAVING LIVE_TM. I DONT WANT THE MODEL WORKING IN THIS CODE FILE THATS WHY I HAVE COMMENTED THE PARTS, IGNORE THE COMMENTED PARTS, JUST TELL ME WHY THE TIMEOUT ERROR IS HAPPENING, HOW TO AVOID IT AND WHAT CAN BE DONE
+ dont regenerate huge code file, just tell ne what to change etc.

@@ -1,0 +1,93 @@
+Tomorrow Morning Order
+
+Step 1
+Run:
+python 08_check_pid_mapping.py
+Expected:
+Selected Features: 139
+Matched Features : 130+
+
+Step 2
+Run:
+python 09_websocket_debug.py
+Write down:
+Loaded PID mappings
+Selected Features
+Matched PIDs
+PARAMETER COUNT
+TELEMETRY FEATURES RECEIVED
+
+Step 3
+If telemetry count is:
+100+
+you're winning.
+
+Step 4
+Save one packet
+Inside websocket loop:
+pd.DataFrame([telemetry]).to_csv(
+    "sample_live_row.csv",
+    index=False
+)
+Just once.
+
+Step 5
+Run:
+python 11_live_model_test.py
+
+Step 6
+Only then start connecting GRU.
+
+If Things Break
+
+Problem
+Matched PIDs = 0
+Solution:
+Feature name mismatch
+
+Problem
+Connected
+but no telemetry
+Solution:
+Check subscription payload
+Check stream name
+
+Problem
+Telemetry count = 9
+Solution:
+Websocket returning only changed params
+Ask guide about on_change=False
+
+Problem
+Telemetry count = 139
+but scaler fails
+Solution:
+Feature ordering mismatch
+
+Problem
+Scaler works
+Model fails
+Solution:
+Need 60-row rolling buffer
+
+Most Important Thing
+
+Don't panic if the GRU isn't running by lunch.
+
+The biggest uncertainty in the entire project is:
+
+Can I fetch live telemetry matching my training features?
+
+If tomorrow you prove:
+
+139 features
+↓
+PID mapping
+↓
+websocket
+↓
+live telemetry
+
+that's already a major milestone and exactly the sort of thing your guide is likely to care about.
+
+The GRU integration is much easier once the data pipeline is confirmed.

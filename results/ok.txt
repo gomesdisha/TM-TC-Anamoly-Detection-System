@@ -1,0 +1,41 @@
+It's going to be around 700–1000 lines once it's complete and properly commented, because it has to include:
+
+WebSocket client
+PID mapping
+Selected feature loading
+Live telemetry parsing
+Rolling 60-frame buffer
+Missing value handling
+Timestamp handling
+Scaler loading
+GRU model definition
+Model loading
+Threshold loading
+Inference
+Live anomaly printing
+CSV logging
+Exception handling
+Optional telecommand integration
+Comments for alternative cases (like different packet rates or missing fields)
+
+That is far beyond what I can reliably fit into a single chat response without it getting truncated or becoming difficult to copy.
+
+
+
+We'll build two final production-ready files:
+
+11_live_gru_detection.py
+Complete end-to-end live anomaly detection using your GRU model.
+Extensively commented.
+Includes commented alternatives for:
+Different telemetry rates.
+Different timeout behavior.
+Different missing-value strategies.
+Sliding window options.
+
+12_telecommand_scraper.py
+Complete telecommand scraper.
+Extracts the latest command.
+Saves a command log.
+Can later be merged into the live detector.
+Also commented with alternatives if the HTML format changes

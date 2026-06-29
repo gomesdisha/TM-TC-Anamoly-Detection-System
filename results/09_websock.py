@@ -1,0 +1,349 @@
+"""Does websocket work?
+How many parameters arrive?
+What does one packet look like?
+
+
+Expected output:
+Connected
+Parameter Count: 500
+or
+Parameter Count: 10"""
+
+import asyncio
+import json
+import time  # <-- ADDED: For periodic refresh timer
+import requests
+import numpy as np
+import pandas as pd
+import torch
+import websockets
+
+from bs4 import BeautifulSoup
+#from tcn_gru_autoencoder import TCN_GRU_Autoencoder
+
+# ==========================================
+# CONFIG
+# ==========================================
+
+WS_URL = "ws://172.20.10.1:9000/ws/ntm"
+COMMAND_PAGE_URL = "http://172.20.10.1:8888/PEPSUMMARY/Summary.jsp?ScName=EOS-10"
+
+WINDOW = 30
+THRESHOLD = 0.0001
+
+buffer = []
+
+# ==========================================
+# MODEL
+# ==========================================
+
+"""model = TCN_GRU_Autoencoder()
+
+model.load_state_dict(
+    torch.load(
+        "tcn_gru_model_10f.pth",
+        map_location="cpu"
+    )
+)
+
+model.eval()"""
+
+
+# ==========================================
+# TELECOMMAND SCRAPING
+# ==========================================
+
+def get_latest_command():
+    try:
+        html = requests.get(COMMAND_PAGE_URL, timeout=5).text
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator=" ")
+
+        if "TCR_R_ON" in text:
+            return "TCR_R_ON"
+        elif "TCR_VOL&CUR_SET_R" in text:
+            return "TCR_VOL&CUR_SET_R"
+        return "NONE"
+    except Exception:
+        return "NONE"
+
+
+# ==========================================
+# COMMAND ENCODING
+# ==========================================
+
+def encode_command(cmd):
+    mapping = {
+        "NONE": 0,
+        "TCR_R_ON": 1,
+        "TCR_VOL&CUR_SET_R": 2
+    }
+    return mapping.get(cmd, 0)
+
+
+# ==========================================
+# TELEMETRY ENCODING
+# ==========================================
+
+def encode_value(value):
+    if isinstance(value, str):
+        value = value.upper()
+        if value in ["ON", "LOCK", "TRUE", "POS-1"]:
+            return 1.0
+        if value in ["OFF", "UNLOCK", "FALSE", "POS-2"]:
+            return 0.0
+        return 0.0
+    try:
+        return float(value)
+    except:
+        return 0.0
+
+
+# ==========================================
+# FEATURE VECTOR
+# ==========================================
+
+def build_feature_vector(telemetry, command):
+    keys = [
+        "XSW-02_SW_POS", "XPA-M_DCDC-1_STS", "XPA-M_DCDC-2_STS",
+        "XPA-R_DCDC-1_STS", "XPA-R_DCDC-2_STS", "PLD_TX-1_STS",
+        "PLD_TX-2_STS", "PLD_TX-1_LOCK_STS", "PLD_TX-2_LOCK_STS"
+    ]
+    return [
+        encode_value(telemetry.get(k, 0))
+        for k in keys
+    ] + [encode_command(command)]
+
+
+# ==========================================
+# DETECTION
+# ==========================================
+
+def detect(window):
+    x = torch.tensor(np.array(window, dtype=np.float32)).unsqueeze(0)
+    with torch.no_grad():
+        reconstructed = model(x)
+        error = torch.mean((x - reconstructed) ** 2).item()
+
+    status = "NORMAL" if error <= THRESHOLD else "ANOMALY"
+    print(f"Score={error:.6f} | Threshold={THRESHOLD:.6f} | Status={status}")
+    return status
+
+
+# ==========================================
+# PID MAPPING & WEBSOCKET CLIENT
+# ==========================================
+
+def fetch_pid_mapping():
+    url = "http://172.20.10.1:9000/pid_info?sc_id=EOS-10"
+    print(f"🔍 Fetching PID map from: {url}")
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not isinstance(data, list):
+            print(f" Unexpected structure: {type(data)}")
+            return {}, {}
+
+        # Go struct uses lowercase keys: "pid", "mnemonic"
+        pid_map = {}  # mnemonic -> pid
+        reverse_pid_map = {}  # pid -> mnemonic
+
+        for item in data:
+            if isinstance(item, dict) and "mnemonic" in item and "pid" in item:
+                mnemonic = item["mnemonic"].upper()
+                pid = item["pid"]
+                pid_map[mnemonic] = pid
+                reverse_pid_map[pid] = mnemonic
+
+        print(f"Loaded {len(pid_map)} PID mappings")
+        return pid_map, reverse_pid_map
+    except Exception as e:
+        print(f" PID fetch failed: {e}")
+        return {}, {}
+
+
+# Initialize PID maps
+PID_MAP, REVERSE_PID_MAP = fetch_pid_mapping()
+
+"""TARGET_MNEMONICS = [
+    "XSW-02_SW_POS", "XPA-M_DCDC-1_STS", "XPA-M_DCDC-2_STS",
+    "XPA-R_DCDC-1_STS", "XPA-R_DCDC-2_STS", "PLD_TX-1_STS",
+    "PLD_TX-2_STS", "PLD_TX-1_LOCK_STS", "PLD_TX-2_LOCK_STS"
+]"""
+
+selected = pd.read_csv("../config/selected_features.csv")
+TARGET_MNEMONICS = (selected.iloc[:,0].astype(str).tolist())
+print(
+    "Selected Features:",
+    len(TARGET_MNEMONICS)
+)#newly added
+
+# Extract PIDs for target mnemonics
+#TARGET_PIDS = [PID_MAP[m] for m in TARGET_MNEMONICS if m in PID_MAP]
+TARGET_PIDS = [
+    PID_MAP[m.upper()]
+    for m in TARGET_MNEMONICS
+    if m.upper() in PID_MAP
+]
+print(
+    "Matched PIDs:",
+    len(TARGET_PIDS)
+)
+
+print(f" Subscribing to PIDs: {TARGET_PIDS}")
+
+
+async def main():
+    if not TARGET_PIDS:
+        print(" No valid PIDs found. Check PID mapping.")
+        return
+
+    try:
+        async with websockets.connect(
+                WS_URL,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5
+        ) as ws:
+            print(" Connected to WS")
+
+            # Construct subscription request matching Go 'request' struct
+            sub_payload = {
+                "user_id": "PRISM",
+                "msg_type": "ntm",
+                "msg_payload": {
+                    "sc_id": "EOS-10",
+                    "stream": "ANY-TM1",
+                    "action": "subscribe",
+                    "parameters": TARGET_PIDS
+                },
+                "on_change": False
+            }
+
+            print(" Sending subscription request...")
+            await ws.send(json.dumps(sub_payload))
+            print(" Subscription sent")
+
+            print("\n Listening for telemetry...")
+            msg_count = 0
+            last_refresh_time = time.time()
+            REFRESH_INTERVAL = 300  # 🔹 Re-subscribe every 5 minutes to force fresh data
+
+            while True:
+                # 🔹 Periodic re-subscription to guarantee continuous data flow
+                if time.time() - last_refresh_time > REFRESH_INTERVAL:
+                    print("🔄 Refreshing subscription...")
+                    await ws.send(json.dumps(sub_payload))
+                    last_refresh_time = time.time()
+
+                try:
+                    # 🔹 REMOVED asyncio.wait_for(timeout=300)
+                    # Now blocks indefinitely until the server sends a message
+                    msg = await ws.recv()
+                    msg_count += 1
+
+                    if msg_count == 1:
+                        print("\n================ RAW MESSAGE ================")
+                        print(msg[:5000])
+                        print("=============================================\n")
+
+                    # Parse response
+                    telemetry = {}
+                    try:
+                        resp = json.loads(msg)
+                        payload = resp.get("msg_payload", {})
+                        params_info = payload.get("parameters_info", [])
+
+                        # 🔹 Skip server ACKs / empty payloads
+                        if not params_info:
+                            print(f"⚠️ ACK/Empty payload received. Msg: {msg[:200]}")
+                            continue
+
+                        print("\n====================")
+                        print("PARAMETER COUNT:", len(params_info))
+                        print("\nFIRST 10 PARAMETERS:")
+                        for p in params_info[:10]:
+                            print(p)
+                        print("====================\n")
+
+                        """print("\nTELEMETRY FEATURES RECEIVED:")
+                        print(len(telemetry))
+                        print("\nFIRST 20 FEATURE NAMES:")
+                        print(list(telemetry.keys())[:20])"""
+
+
+                        for p in params_info:
+                            pid = p.get("param")
+                            mnemonic = REVERSE_PID_MAP.get(pid)
+                            if mnemonic:
+                                # Value extraction matching Go 'Parameter' struct
+                                val = p.get("str_v") if p.get("str_v") else p.get("float_v")
+                                telemetry[mnemonic] = val
+                                print(f"   {mnemonic} ({pid}): {val}")
+
+                        print("\nTELEMETRY FEATURES RECEIVED:")
+                        print(len(telemetry))
+                        print("\nFIRST 20 FEATURE NAMES:")
+                        print(list(telemetry.keys())[:20])
+
+                        # ==========================================
+                        # SAVE LIVE TELEMETRY
+                        # ==========================================
+
+                        if not hasattr(main, "rows"):
+                            main.rows = []
+
+                        main.rows.append(telemetry.copy())
+                        telemetry["Timestamp"] = payload.get("frame_time")
+
+                        # 🔹 CHANGED: % 50 -> % 1 so it saves immediately for debugging
+                        if len(main.rows) % 1 == 0:
+                            pd.DataFrame(main.rows).to_csv(
+                                "live_tm.csv",
+                                index=False
+                            )
+
+                            print(
+                                f"✅ Saved {len(main.rows)} row(s) to live_tm.csv"
+                            )
+
+                    except json.JSONDecodeError as je:
+                        print(f" Invalid JSON: {je}")
+                    except Exception as proc_err:
+                        print(f" Processing error: {proc_err}")
+
+                    # Build feature vector and detect
+                    """command = await asyncio.to_thread(get_latest_command)
+                    fv = build_feature_vector(telemetry, command)
+                    buffer.append(fv)
+                    if len(buffer) > WINDOW:
+                        buffer.pop(0)
+                    if len(buffer) == WINDOW:
+                        detect(buffer)"""
+
+                except websockets.exceptions.ConnectionClosed as e:
+                    print(f" Connection closed: {e}")
+                    break
+                except Exception as e:
+                    print(f" Unexpected error: {e}")
+                    break
+
+    except Exception as e:
+        print(f" Connection failed: {e}")
+
+
+if __name__ == "__main__":
+    print("Starting WebSocket telemetry listener...")
+    asyncio.run(main())
+
+"""Receive websocket packet
+        ↓
+Build telemetry dictionary
+        ↓
+Print telemetry info
+        ↓
+Save telemetry row
+        ↓
+Wait for next packet"""
